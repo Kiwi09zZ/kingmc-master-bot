@@ -1,0 +1,1202 @@
+/**
+ * index.js - Main Entrypoint for Discord Bot & Minecraft Worker Nodes
+ * @description Hỗ trợ 3 chế độ hoạt động via BOT_ROLE:
+ * - 'master': Chỉ chạy Discord Bot & Quản lý Hàng Đợi (Queue Dispatcher)
+ * - 'worker': Chỉ chạy Minecraft Bot & Mở HTTP API Server tiếp nhận request từ Master
+ * - 'standalone' (Mặc định): Chạy cả Discord Bot lẫn 1 Minecraft Bot local
+ */
+
+require('dotenv').config();
+const http = require('http');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const PersistentBot = require('./mc-bot');
+const QueueDispatcher = require('./queue-dispatcher');
+const CommandHandler = require('./handlers/commandHandler');
+const { handleReportButtons, sendBanAlert } = require('./helpers/reportHelper');
+const configHelper = require('./helpers/configHelper');
+const { handleAiChatMessage } = require('./handlers/aiChatHandler');
+const { handleMathMessage, isMathExpression } = require('./handlers/mathHandler');
+const trackerHelper = require('./helpers/trackerHelper');
+const { handleTrackerButtons, buildTrackerOverviewMessage } = require('./handlers/trackerButtonHandler');
+const { handlePaginationButtons } = require('./helpers/paginationHelper');
+const skinHelper = require('./helpers/skinHelper');
+const { getCustomEmoji } = require('./helpers/utils');
+const { connectMongo, isMongoAvailable, getSystemConfig } = require('./helpers/mongoHelper');
+const { handleDashboardRequest, syncDiscordGuilds } = require('./handlers/dashboardHandler');
+const renderManager = require('./helpers/renderManager');
+const masterElection = require('./helpers/masterElection');
+
+/**
+ * Lấy Master URL hiệu dụng (ưu tiên cấu hình động từ MongoDB Atlas để tự động xoay chuyển)
+ */
+async function getEffectiveMasterUrl() {
+  if (isMongoAvailable()) {
+    try {
+      const dbUrl = await getSystemConfig('master_url', null);
+      if (dbUrl && String(dbUrl).startsWith('http')) return String(dbUrl).trim();
+    } catch (e) {}
+  }
+  return process.env.MASTER_URL || process.env.RENDER_EXTERNAL_URL || '';
+}
+
+
+// Cấu hình từ .env
+const BOT_ROLE = (process.env.BOT_ROLE || 'standalone').toLowerCase();
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const WORKER_SECRET = process.env.WORKER_SECRET || '';
+const ADMIN_ID = (process.env.ADMIN_ID || '').trim(); // Dùng để cấu hình Admin ID chạy lệnh qua DM
+
+const MC_AUTH_TYPE = process.env.MC_AUTH_TYPE || 'offline';
+const MC_SERVER_PORT = parseInt(process.env.MC_SERVER_PORT) || 25565;
+const BOT_CHECK_TIMEOUT = parseInt(process.env.BOT_CHECK_TIMEOUT) || 15000;
+
+const MC_SERVER_HOSTS = (process.env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
+  .split(',')
+  .map(h => h.trim())
+  .filter(h => h.length > 0);
+
+// Global Variables
+global.isBotMaintenance = false;
+global.maintenanceMessage = '';
+global.isAiChatEnabled = false; // Mặc định TẮT tính năng AI Chat
+global.aiDisableReason = 'Tính năng trò chuyện AI hiện đang tạm tắt bởi Admin.';
+global.globalDiscordClient = null;
+global.runTrackerCheckCycle = null;
+
+
+console.log(`==================================================`);
+console.log(`🚀 Bắt đầu khởi động hệ thống với Chế độ: [${BOT_ROLE.toUpperCase()}]`);
+console.log(`==================================================`);
+
+// Khởi tạo SkinHelper sớm để nạp Cache
+skinHelper.initSkinHelper().catch(e => console.warn('[SkinHelper] Lỗi khởi tạo ban đầu:', e.message));
+
+// Helper gen chuỗi ngẫu nhiên 10 ký tự (chữ hoa, chữ thường, số)
+function generateRandomUsername(length = 10) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+/**
+ * Gửi tin nhắn an toàn (tự động chia nhỏ văn bản nếu vượt quá 1900 ký tự)
+ */
+async function safeSend(channel, payload) {
+  if (typeof payload === 'string') {
+    if (payload.length <= 1900) {
+      return await channel.send(payload);
+    }
+    const chunks = [];
+    let remaining = payload;
+    while (remaining.length > 0) {
+      if (remaining.length <= 1900) {
+        chunks.push(remaining);
+        break;
+      }
+      let splitIdx = remaining.lastIndexOf('\n', 1900);
+      if (splitIdx === -1 || splitIdx < 500) splitIdx = 1900;
+      chunks.push(remaining.substring(0, splitIdx));
+      remaining = remaining.substring(splitIdx).trimStart();
+    }
+    for (const chunk of chunks) {
+      await channel.send(chunk);
+    }
+    return;
+  }
+  return await channel.send(payload);
+}
+
+// 1. Khởi tạo Local Minecraft Bot (Nếu ở chế độ 'worker' hoặc 'standalone')
+let localMcBot = null;
+if (BOT_ROLE === 'worker' || BOT_ROLE === 'standalone') {
+  // Tự tạo random 10 ký tự chữ hoa/thường mỗi khi khởi động (bỏ đọc từ env)
+  const credentials = {
+    username: generateRandomUsername(10),
+    authType: MC_AUTH_TYPE,
+    password: generateRandomUsername(10)
+  };
+
+  console.log(`[Worker] Khởi tạo Minecraft Bot với Username: [${credentials.username}] và Password: [${credentials.password}]`);
+  localMcBot = new PersistentBot(credentials, MC_SERVER_HOSTS, MC_SERVER_PORT);
+  
+  localMcBot.on('notifyAdmin', async (message) => {
+    const MASTER_URL = await getEffectiveMasterUrl();
+    if (BOT_ROLE === 'standalone' && global.globalDiscordClient && ADMIN_ID) {
+      try {
+        const adminUser = await global.globalDiscordClient.users.fetch(ADMIN_ID);
+        if (adminUser) adminUser.send(message);
+      } catch (e) {}
+    } else if (MASTER_URL) {
+      const targetUrl = new URL('/api/notify', MASTER_URL);
+      const transport = targetUrl.protocol === 'https:' ? require('https') : require('http');
+      const reqNotify = transport.request(targetUrl.href, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-worker-secret': WORKER_SECRET || ''
+        }
+      });
+      reqNotify.on('error', (err) => console.error(`[Worker] Lỗi gửi notify về Master: ${err.message}`));
+      reqNotify.write(JSON.stringify({ message }));
+      reqNotify.end();
+    } else if (BOT_ROLE === 'worker') {
+      console.log(`[Worker-Notify] Cần thông báo nhưng thiếu MASTER_URL: ${message}`);
+    }
+  });
+
+  localMcBot.on('ipLimitDetected', async ({ username, reason }) => {
+    console.warn(`[Worker] 🚨 Nhận tín hiệu ipLimitDetected: [${username}] - Lý do: [${reason}]`);
+    const MASTER_URL = await getEffectiveMasterUrl();
+    if (MASTER_URL) {
+      try {
+        const targetUrl = new URL('/api/worker-ip-limit', MASTER_URL);
+        const transport = targetUrl.protocol === 'https:' ? require('https') : require('http');
+        const payload = JSON.stringify({
+          accountId: process.env.RENDER_ACCOUNT_ID || '',
+          serviceId: process.env.RENDER_SERVICE_ID || '',
+          serviceName: process.env.RENDER_SERVICE_NAME || '',
+          username,
+          reason,
+          workerUrl: process.env.RENDER_EXTERNAL_URL || process.env.WORKER_URL || ''
+        });
+        const reqLimit = transport.request(targetUrl.href, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-worker-secret': WORKER_SECRET || ''
+          }
+        }, (resLimit) => {
+          let resBody = '';
+          resLimit.on('data', chunk => resBody += chunk);
+          resLimit.on('end', () => {
+            console.log(`[Worker] 📡 Kết quả gửi ipLimitDetected về Master: HTTP ${resLimit.statusCode} - ${resBody}`);
+          });
+        });
+        reqLimit.on('error', (err) => console.error(`[Worker] Lỗi gửi ipLimitDetected về Master: ${err.message}`));
+        reqLimit.write(payload);
+        reqLimit.end();
+      } catch (err) {
+        console.error(`[Worker] Lỗi gửi ipLimitDetected: ${err.message}`);
+      }
+    } else if (BOT_ROLE === 'standalone') {
+      renderManager.rotateWorker({
+        workerUrl: process.env.RENDER_EXTERNAL_URL || 'standalone',
+        reason,
+        username,
+        queueDispatcher,
+        discordClient: global.globalDiscordClient,
+        adminId: ADMIN_ID
+      }).catch(e => console.error('[Standalone] Lỗi xoay worker:', e.message));
+    }
+  });
+
+  localMcBot.connect();
+}
+
+// Khởi tạo Queue Dispatcher sớm cho Master / Standalone
+let queueDispatcher = null;
+if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
+  queueDispatcher = new QueueDispatcher();
+  if (localMcBot) {
+    queueDispatcher.setLocalBot(localMcBot);
+  }
+}
+
+// Tự động đồng bộ Master URL tới Google Apps Script Keep-Alive
+async function syncMasterKeepalive() {
+  if (BOT_ROLE !== 'master' && BOT_ROLE !== 'standalone') return;
+  try {
+    const masterUrl = (await getSystemConfig('master_url', null)) || process.env.RENDER_EXTERNAL_URL || process.env.MASTER_URL || '';
+    if (masterUrl && masterUrl.startsWith('http')) {
+      await renderManager.notifyGoogleAppsScript('add', masterUrl, { isMaster: true });
+    }
+  } catch (err) {
+    console.warn('[KeepAlive] Không thể tự động đồng bộ Master URL với Google Apps Script:', err.message);
+  }
+}
+
+// Kết nối MongoDB tập trung sớm và nạp Worker
+connectMongo().then(async (connected) => {
+  if (connected) {
+    await configHelper.syncFromMongo();
+    if (queueDispatcher) {
+      await queueDispatcher.initWorkers();
+    }
+    syncMasterKeepalive().catch(() => {});
+  }
+}).catch(err => {
+  console.warn('[MongoHelper] Lỗi khởi tạo MongoDB ban đầu:', err.message);
+});
+
+// 2. Khởi tạo HTTP Server (Health Check cho Render & Worker API endpoints & Dashboard Web UI)
+const PORT = parseInt(process.env.SERVER_PORT || process.env.PORT) || 3000;
+const HOST = '0.0.0.0';
+
+// Bộ nhớ đệm giới hạn IP (Rate Limiter)
+const ipRateLimitMap = new Map();
+
+// Tự động dọn dẹp bộ nhớ đệm IP mỗi 10 giây
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of ipRateLimitMap.entries()) {
+    if (now - data.startTime > 10000) {
+      ipRateLimitMap.delete(ip);
+    }
+  }
+}, 10000);
+
+const server = http.createServer(async (req, res) => {
+
+  // --- IP Rate Limiting (Chống Spam/DDoS Lớp 7) ---
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const authSecret = req.headers['x-worker-secret'];
+  
+  // NẾU CÓ KHÓA BÍ MẬT HỢP LỆ (TỪ MASTER GỬI TỚI) -> BỎ QUA RATE LIMIT
+  const isMaster = WORKER_SECRET && authSecret === WORKER_SECRET;
+
+  if (clientIp && !isMaster) {
+    const now = Date.now();
+    let rateData = ipRateLimitMap.get(clientIp);
+    
+    if (!rateData) {
+      rateData = { count: 1, startTime: now };
+      ipRateLimitMap.set(clientIp, rateData);
+    } else {
+      if (now - rateData.startTime < 10000) { // Khung thời gian: 10 giây
+        rateData.count++;
+        if (rateData.count > 20) { // Giới hạn: Tối đa 20 requests / 10 giây
+          res.writeHead(429, { 'Content-Type': 'text/plain' });
+          return res.end('429 Too Many Requests: Bạn đang spam quá nhanh!');
+        }
+      } else {
+        // Hết khung 10s, reset lại bộ đếm
+        rateData.count = 1;
+        rateData.startTime = now;
+      }
+    }
+  }
+  // --- Kết thúc Rate Limiting ---
+
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  // Endpoint kiểm tra Health Check
+  if (url.pathname === '/health' || (BOT_ROLE === 'worker' && url.pathname === '/')) {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    const isOnline = localMcBot ? localMcBot.isBotOnline : true;
+    const isReady = localMcBot ? localMcBot.isReady : true;
+    const isBusy = localMcBot ? (!localMcBot.isReady || !!localMcBot.targetPlayer) : false;
+
+    const healthStatus = {
+      status: 'OK',
+      role: BOT_ROLE,
+      online: isOnline,
+      ready: isReady,
+      busy: isBusy,
+      username: localMcBot ? localMcBot.credentials.username : 'NoLocalBot',
+      isLeader: BOT_ROLE === 'master' ? masterElection.isLeader : (BOT_ROLE === 'standalone' ? true : undefined),
+      masterInstanceId: BOT_ROLE === 'master' ? masterElection.instanceId : undefined,
+      timestamp: new Date().toISOString()
+    };
+    return res.end(JSON.stringify(healthStatus));
+  }
+
+  // Endpoint API restart dành cho Worker Node từ xa
+  if (url.pathname === '/api/restart' && req.method === 'POST') {
+    if (WORKER_SECRET) {
+      const authHeader = req.headers['x-worker-secret'];
+      if (authHeader !== WORKER_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ success: false, error: 'Unauthorized: Sai WORKER_SECRET' }));
+      }
+    }
+
+    if (!localMcBot) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ success: false, error: 'Node này không chạy Local Worker' }));
+    }
+
+    const newUsername = generateRandomUsername(10);
+    const newPassword = generateRandomUsername(10);
+    localMcBot.credentials.username = newUsername;
+    localMcBot.credentials.password = newPassword;
+
+    console.log(`[Worker] 🔄 Nhận lệnh restart từ xa từ Master. Username mới: [${newUsername}], Password mới: [${newPassword}]`);
+
+    if (localMcBot.bot) {
+      localMcBot.bot.end('Remote restart request');
+    } else {
+      localMcBot.scheduleReconnect();
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify({
+      success: true,
+      message: 'Đã nhận lệnh restart thành công',
+      username: newUsername
+    }));
+  }
+
+  // Endpoint API nhận thông báo (từ Worker gửi về Master)
+  if (url.pathname === '/api/notify' && req.method === 'POST') {
+    if (WORKER_SECRET) {
+      const authHeader = req.headers['x-worker-secret'];
+      if (authHeader !== WORKER_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ success: false, error: 'Unauthorized: Sai WORKER_SECRET' }));
+      }
+    }
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body);
+        const { message } = payload;
+        if (global.globalDiscordClient && ADMIN_ID && message) {
+          try {
+            const adminUser = await global.globalDiscordClient.users.fetch(ADMIN_ID);
+            if (adminUser) adminUser.send(message);
+          } catch(e) {
+            console.error('Không thể gửi DM notify:', e.message);
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint API nhận báo cáo Worker bị giới hạn IP / Ban IP -> Kích hoạt xoay Worker trên Render
+  if (url.pathname === '/api/worker-ip-limit' && req.method === 'POST') {
+    if (WORKER_SECRET) {
+      const authHeader = req.headers['x-worker-secret'];
+      if (authHeader !== WORKER_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ success: false, error: 'Unauthorized: Sai WORKER_SECRET' }));
+      }
+    }
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const { username, reason, workerUrl, accountId, serviceId } = payload;
+        console.warn(`[Master API] 🚨 Nhận báo cáo IP Limit từ Worker [${username || 'N/A'}] (Account: ${accountId || 'N/A'}, Service: ${serviceId || 'N/A'}, URL: ${workerUrl || 'N/A'}): ${reason}`);
+        
+        // Kích hoạt tiến trình Xoay Render Worker bất đồng bộ
+        renderManager.rotateWorker({
+          accountId,
+          serviceId,
+          workerUrl,
+          reason,
+          username,
+          queueDispatcher,
+          discordClient: global.globalDiscordClient,
+          adminId: ADMIN_ID
+        }).then(result => {
+          console.log('[Master API] Kết quả xoay Render Worker:', result);
+        }).catch(err => {
+          console.error('[Master API] Lỗi khi xoay Render Worker:', err.message);
+        });
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          success: true,
+          message: 'Đã nhận báo cáo giới hạn IP và bắt đầu tiến trình xoay Worker.'
+        }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Endpoint API thực thi lệnh dành cho Worker Node
+  if (url.pathname === '/api/execute' && req.method === 'POST') {
+    if (WORKER_SECRET) {
+      const authHeader = req.headers['x-worker-secret'];
+      if (authHeader !== WORKER_SECRET) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ success: false, error: 'Unauthorized: Sai WORKER_SECRET' }));
+      }
+    }
+
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const payload = JSON.parse(body);
+        const { action, player, timeoutMs } = payload;
+
+        if (!localMcBot || !localMcBot.isBotOnline || !localMcBot.isReady) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Worker Minecraft Bot chưa sẵn sàng (đang kết nối hoặc AFK setup)' }));
+        }
+
+        if (localMcBot.targetPlayer) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Worker Minecraft Bot đang bận' }));
+        }
+
+        let result;
+        if (action === 'stats') {
+          result = await localMcBot.getStats(player, timeoutMs || 15000);
+        } else if (action === 'bal') {
+          result = await localMcBot.getBalance(player, timeoutMs || 15000);
+        } else if (action === 'order') {
+          result = await localMcBot.getOrder(player, timeoutMs || 15000);
+        } else if (action === 'ah') {
+          result = await localMcBot.getAh(player, timeoutMs || 15000);
+        } else if (action === 'online') {
+          result = await localMcBot.getOnline(player, timeoutMs || 15000);
+        } else if (action === 'leaderboard' || action === 'lb') {
+          result = await localMcBot.getLeaderboard(player, timeoutMs || 20000);
+        } else if (action === 'bounty') {
+          result = await localMcBot.getBounty(player, timeoutMs || 15000);
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ success: false, error: 'Hành động không hợp lệ' }));
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, result }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // 2. Phục vụ Web UI Dashboard & Dashboard REST API nếu là Master hoặc Standalone
+  if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
+    try {
+      const handled = await handleDashboardRequest(req, res, {
+        queueDispatcher,
+        discordClient: global.globalDiscordClient,
+        runCheckCycle: () => {
+          if (typeof global.runTrackerCheckCycle === 'function') {
+            return global.runTrackerCheckCycle();
+          }
+          return Promise.reject(new Error('Tiến trình kiểm tra chưa khởi động'));
+        }
+      });
+      if (handled) return;
+    } catch (err) {
+      console.error('[DashboardHandler] Lỗi xử lý request:', err.message);
+    }
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ success: false, error: 'Endpoint không tồn tại' }));
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[HTTP-Server] Đang lắng nghe trên ${HOST}:${PORT} (${BOT_ROLE.toUpperCase()}).`);
+  setTimeout(() => {
+    syncMasterKeepalive().catch(() => {});
+  }, 3000);
+});
+
+/**
+ * Tiến trình kiểm tra định kỳ số dư toàn bộ người chơi đang được theo dõi
+ * Chạy mỗi 1 giờ trên Master Node
+ */
+function startTrackerScheduler(queueDispatcher) {
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const intervalMs = parseInt(process.env.TRACKER_INTERVAL_MS) || ONE_HOUR_MS;
+
+  console.log(`[TrackerScheduler] ⏱️ Đã kích hoạt tiến trình theo dõi số dư (Chu kỳ: ${intervalMs / 1000}s/lần)...`);
+
+  let isChecking = false;
+
+  function renderProgressBar(completed, total, barLen = 10) {
+    if (total === 0) return '░'.repeat(barLen);
+    const ratio = Math.min(1, Math.max(0, completed / total));
+    const filled = Math.round(ratio * barLen);
+    const empty = Math.max(0, barLen - filled);
+    return '▓'.repeat(filled) + '░'.repeat(empty);
+  }
+
+  function formatProgressText(completed, total, success, fail, lastRecord = null) {
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const bar = renderProgressBar(completed, total, 10);
+    const barrierEmoji = getCustomEmoji('barrier');
+    let text = `🔄 **Đang kiểm tra số dư định kỳ cho các tài khoản theo dõi...**\n` +
+      `📊 Tiến độ: \`[ ${bar} ]\` **${completed}/${total}** (${percent}%)\n` +
+      `• Thành công: **${success}** ✅ | Thất bại: **${fail}** ${barrierEmoji}`;
+    if (lastRecord && lastRecord.player) {
+      const statusIcon = lastRecord.success ? '✅' : barrierEmoji;
+      text += `\n• Vừa kiểm tra: **${lastRecord.player}** ${statusIcon} *(Worker: ${lastRecord.worker || 'Local'})*`;
+    }
+    return text;
+  }
+
+  async function runCheckCycle(targetContext = null) {
+    let targetChannel = null;
+    let statusMsg = null;
+    let targetInteraction = null;
+
+    if (targetContext) {
+      if (typeof targetContext.send === 'function') {
+        targetChannel = targetContext;
+      } else if (targetContext.isCommand || targetContext.isButton || (targetContext.user && targetContext.editReply)) {
+        targetInteraction = targetContext;
+        targetChannel = targetContext.channel;
+      } else if (typeof targetContext === 'object') {
+        targetChannel = targetContext.channel || null;
+        statusMsg = targetContext.message || null;
+        targetInteraction = targetContext.interaction || null;
+      }
+    }
+
+    if (isChecking) {
+      const barrierEmoji = getCustomEmoji('barrier');
+      const runningMsg = `${barrierEmoji} Tiến trình kiểm tra số dư hiện đang chạy, vui lòng đợi hoàn tất chu kỳ này.`;
+      console.log(`[TrackerScheduler] ${runningMsg}`);
+      if (targetInteraction) {
+        await targetInteraction.editReply({ content: runningMsg }).catch(() => {});
+      } else if (statusMsg) {
+        await statusMsg.edit(runningMsg).catch(() => {});
+      } else if (targetChannel) {
+        await safeSend(targetChannel, runningMsg).catch(() => {});
+      }
+      return;
+    }
+
+    isChecking = true;
+    const startTime = Date.now();
+    let completedCount = 0;
+    let successCount = 0;
+    let failCount = 0;
+
+    let lastEditTime = 0;
+    let editTimer = null;
+    let pendingText = null;
+
+    const updateProgress = async (text, force = false) => {
+      pendingText = text;
+      const now = Date.now();
+      if (force || now - lastEditTime >= 1500) {
+        if (editTimer) {
+          clearTimeout(editTimer);
+          editTimer = null;
+        }
+        lastEditTime = now;
+        const content = pendingText;
+        pendingText = null;
+        try {
+          if (statusMsg) {
+            await statusMsg.edit(content).catch(() => {});
+          }
+          if (targetInteraction) {
+            await targetInteraction.editReply({ content }).catch(() => {});
+          }
+        } catch (e) {
+          // ignore
+        }
+      } else if (!editTimer) {
+        editTimer = setTimeout(() => {
+          editTimer = null;
+          updateProgress(pendingText, true);
+        }, 1500 - (now - lastEditTime));
+      }
+    };
+
+    try {
+      const trackedPlayers = await trackerHelper.getAllTrackedPlayers();
+      if (!trackedPlayers || trackedPlayers.length === 0) {
+        const emptyMsg = 'ℹ️ Hiện chưa có người chơi nào trong danh sách theo dõi.';
+        if (targetInteraction) {
+          await targetInteraction.editReply({ content: emptyMsg }).catch(() => {});
+        } else if (statusMsg) {
+          await statusMsg.edit(emptyMsg).catch(() => {});
+        } else if (targetChannel) {
+          await safeSend(targetChannel, emptyMsg).catch(() => {});
+        }
+        return;
+      }
+
+      console.log(`[TrackerScheduler] 🔄 Bắt đầu chu kỳ kiểm tra số dư định kỳ cho ${trackedPlayers.length} người chơi: [${trackedPlayers.join(', ')}]`);
+
+      // Gửi tin nhắn khởi tạo nếu chưa có
+      if (!statusMsg && !targetInteraction && targetChannel) {
+        statusMsg = await safeSend(targetChannel, formatProgressText(0, trackedPlayers.length, 0, 0)).catch(() => null);
+      } else {
+        await updateProgress(formatProgressText(0, trackedPlayers.length, 0, 0), true);
+      }
+
+      // Callback lưu số dư và cập nhật tiến trình ngay khi 1 player hoàn thành
+      const handlePlayerRecord = async (record) => {
+        completedCount++;
+        if (record.success && record.result) {
+          successCount++;
+          const rawBal = record.result;
+          const balStr = (rawBal && typeof rawBal === 'object' && rawBal.balance) ? rawBal.balance : String(rawBal || '');
+          let cleanVal = balStr;
+          if (cleanVal && cleanVal.includes('$')) {
+            const dollarIndex = cleanVal.indexOf('$');
+            cleanVal = cleanVal.substring(dollarIndex).replace(/balance/gi, '').trim();
+          }
+
+          if (cleanVal) {
+            await trackerHelper.addBalanceRecord(record.player, cleanVal);
+            console.log(`[TrackerScheduler] ✅ [${record.worker}] Đã lưu số dư mới cho "${record.player}": ${cleanVal}`);
+          }
+        } else {
+          failCount++;
+        }
+
+        // Cập nhật tiến trình thời gian thực
+        updateProgress(formatProgressText(completedCount, trackedPlayers.length, successCount, failCount, record));
+      };
+
+      // Phân bổ trải đều người chơi cho các Worker chạy song song
+      const batchResult = await queueDispatcher.dispatchBatchTasks(
+        'bal',
+        trackedPlayers,
+        BOT_CHECK_TIMEOUT,
+        3000, // delay 3 giây an toàn giữa các lệnh trên cùng 1 worker để tránh spam KingMC
+        handlePlayerRecord
+      );
+
+      const durationSec = Math.round((Date.now() - startTime) / 1000);
+      console.log(`[TrackerScheduler] 🏁 Hoàn thành chu kỳ kiểm tra số dư định kỳ (${successCount} thành công, ${failCount} thất bại qua ${batchResult.workerCount} workers).`);
+
+      const barrierEmoji = getCustomEmoji('barrier');
+      const summaryText = `🏁 **Đã hoàn thành chu kỳ kiểm tra số dư định kỳ:**\n` +
+        `• Tổng số người chơi: **${batchResult.total}**\n` +
+        `• Thành công: **${successCount}** ✅\n` +
+        `• Thất bại / Timeout: **${failCount}** ${barrierEmoji}\n` +
+        `• Số Worker tham gia: **${batchResult.workerCount}** (${batchResult.workers.join(', ')})\n` +
+        `• Thời gian thực hiện: **${durationSec}s**`;
+
+      await updateProgress(summaryText, true);
+
+      // Nếu chỉ có targetChannel thuần túy không gửi được statusMsg từ đầu, gửi tin nhắn tổng kết
+      if (!statusMsg && !targetInteraction && targetChannel) {
+        await safeSend(targetChannel, summaryText).catch(() => {});
+      }
+    } catch (cycleErr) {
+      console.error('[TrackerScheduler] Lỗi trong chu kỳ kiểm tra:', cycleErr.message);
+      const errText = `❌ Đã xảy ra lỗi trong chu kỳ kiểm tra: \`${cycleErr.message}\``;
+      await updateProgress(errText, true);
+      if (!statusMsg && !targetInteraction && targetChannel) {
+        await safeSend(targetChannel, errText).catch(() => {});
+      }
+    } finally {
+      if (editTimer) {
+        clearTimeout(editTimer);
+        editTimer = null;
+      }
+      isChecking = false;
+    }
+  }
+
+  // Khởi chạy vòng lặp setInterval
+  const timer = setInterval(runCheckCycle, intervalMs);
+  global.runTrackerCheckCycle = runCheckCycle;
+
+  return { runCheckCycle, timer };
+}
+
+// 3. Khởi tạo Discord Client (Nếu ở chế độ 'master' hoặc 'standalone')
+if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.MessageContent
+    ],
+    partials: [Partials.Channel, Partials.Message, Partials.User]
+  });
+  
+  global.globalDiscordClient = client;
+
+  if (localMcBot) {
+    localMcBot.on('banDetected', async (data) => {
+      const { oldUsername, newUsername, password, reason } = data;
+      console.warn(`[Index] Phát hiện bot bị BAN. Cũ: ${oldUsername}, Mới: ${newUsername}`);
+      
+      if (ADMIN_ID) {
+         try {
+           const adminUser = await client.users.fetch(ADMIN_ID);
+           if (adminUser) {
+             adminUser.send(`🚨 **CẢNH BÁO BAN TÀI KHOẢN** 🚨\n- **Bot cũ**: \`${oldUsername}\`\n- **Mật khẩu**: ||${password}||\n- **Lý do quét được**: \`${reason}\`\n- **Tên bot mới (đã tự động đổi)**: \`${newUsername}\`\nHệ thống đang tự động khởi động lại worker này.`);
+           }
+         } catch(e) {
+           console.error('Không thể gửi DM cho Admin:', e);
+         }
+      } else {
+         sendBanAlert(client, oldUsername, reason);
+      }
+    });
+  }
+
+  const commandHandler = new CommandHandler(client, queueDispatcher);
+  commandHandler.loadCommands();
+
+  let isHelpersInitialized = false;
+  client.on('clientReady', async () => {
+    console.log(`[Discord-Bot] Bot đã trực tuyến với tên: ${client.user.tag}`);
+
+    // Đăng ký Slash Commands và đồng bộ Guild trong nền (non-blocking) để bot phản hồi lệnh ngay lập tức
+    setImmediate(async () => {
+      await commandHandler.registerSlashCommands(DISCORD_TOKEN, CLIENT_ID, GUILD_ID).catch(e => console.warn('[Index] Lỗi đăng ký Slash Commands:', e.message));
+      await syncDiscordGuilds(client).catch(e => console.warn('[Index] Lỗi đồng bộ Guild ban đầu:', e.message));
+    });
+
+    if (!isHelpersInitialized) {
+      isHelpersInitialized = true;
+      // Khởi tạo hệ thống lưu trữ theo dõi số dư (MongoDB / JSON)
+      trackerHelper.initTracker().catch(() => {});
+      // Khởi tạo hệ thống lưu trữ skin (MongoDB / JSON)
+      skinHelper.initSkinHelper().catch(() => {});
+    }
+
+    // Khởi chạy tiến trình kiểm tra số dư định kỳ 1 giờ / lần (nếu chưa chạy)
+    if (!global.trackerSchedulerInstance) {
+      global.trackerSchedulerInstance = startTrackerScheduler(queueDispatcher);
+      global.runTrackerCheckCycle = global.trackerSchedulerInstance?.runCheckCycle;
+    }
+  });
+
+  // Tự động đồng bộ khi Bot tham gia hoặc rời server Discord
+  client.on('guildCreate', async () => {
+    await syncDiscordGuilds(client).catch(e => console.warn('[Index] Lỗi đồng bộ guildCreate:', e.message));
+  });
+  client.on('guildDelete', async () => {
+    await syncDiscordGuilds(client).catch(e => console.warn('[Index] Lỗi đồng bộ guildDelete:', e.message));
+  });
+
+  client.on('interactionCreate', async (interaction) => {
+    // Chặn nếu là Master Node nhưng không phải Active Leader (Standby)
+    if (BOT_ROLE === 'master' && !masterElection.isLeader) {
+      return;
+    }
+
+    // Chặn Slash Commands khi bảo trì
+    if (global.isBotMaintenance && interaction.isChatInputCommand()) {
+       if (!ADMIN_ID || interaction.user.id !== ADMIN_ID) {
+          const barrierEmoji = getCustomEmoji('barrier');
+          return interaction.reply({ content: `${barrierEmoji} **Bảo trì:** ${global.maintenanceMessage}`, ephemeral: true });
+       }
+    }
+
+    // Xử lý nút báo lỗi Admin
+    const isReportHandled = await handleReportButtons(interaction, client);
+    if (isReportHandled) return;
+
+    // Xử lý nút Theo dõi & Xuất biểu đồ số dư
+    const isTrackerHandled = await handleTrackerButtons(interaction);
+    if (isTrackerHandled) return;
+
+    // Xử lý nút Phân trang (AH & Order) với TTL 20s
+    const isPaginationHandled = await handlePaginationButtons(interaction);
+    if (isPaginationHandled) return;
+
+    // Xử lý Slash Commands
+    await commandHandler.handleInteraction(interaction);
+  });
+
+  // Lắng nghe lệnh qua DM hoặc Kênh chat (Admin)
+  // Lắng nghe lệnh qua DM hoặc Kênh chat (Admin & User)
+  client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+
+    // Chặn nếu là Master Node nhưng không phải Active Leader (Standby)
+    if (BOT_ROLE === 'master' && !masterElection.isLeader) {
+      return;
+    }
+
+    // 1. Nhận diện ngữ cảnh: Tin nhắn riêng (DM)
+    const isDirectMessage = !message.guild;
+    const cleanText = (message.content || '').trim();
+
+    // Danh sách lệnh hợp lệ
+    const allowedCommands = ['stats', 'order', 'bal', 'ah', 'online', 'ping', 'help', 'lb', 'donate', 'bounty', 'item', 'math', 'ai', 'chat'];
+    const adminCommands = ['help', 'status', 'workers', 'restart', 'mode', 'render', 'toggle', 'ai', 'tracker', 'theodoi', 'master', 'failover'];
+
+    // 2. Kiểm tra xem có phải lệnh game/người dùng hay không
+    // Hỗ trợ: ?stats trong server hoặc stats trong DM
+    let isGameCommand = false;
+    let commandName = '';
+    let commandArgs = [];
+    let showPrefixTip = false;
+
+    if (cleanText.startsWith('?')) {
+      commandArgs = cleanText.slice(1).trim().split(/ +/);
+      commandName = commandArgs.shift()?.toLowerCase();
+      if (allowedCommands.includes(commandName)) {
+        isGameCommand = true;
+        showPrefixTip = !isDirectMessage;
+      }
+    } else if (isDirectMessage && cleanText) {
+      commandArgs = cleanText.split(/ +/);
+      const firstWord = commandArgs.shift()?.toLowerCase();
+      if (allowedCommands.includes(firstWord)) {
+        isGameCommand = true;
+        commandName = firstWord;
+        showPrefixTip = false;
+      }
+    }
+
+    // --- XỬ LÝ LỆNH GAME / NGƯỜI DÙNG ---
+    if (isGameCommand) {
+      const command = client.commands.get(commandName);
+      if (!command) return;
+
+      const barrierEmoji = getCustomEmoji('barrier');
+
+      // Chặn nếu đang bảo trì (trừ Admin)
+      if (global.isBotMaintenance) {
+        if (!ADMIN_ID || message.author.id !== ADMIN_ID) {
+          return message.channel.send(`${barrierEmoji} **Bảo trì:** ${global.maintenanceMessage}`);
+        }
+      }
+
+      const argStr = commandArgs.join(' ').trim();
+      const noArgRequiredCommands = ['ping', 'help', 'lb', 'donate', 'bounty'];
+      if (!noArgRequiredCommands.includes(commandName) && !argStr) {
+        const exampleSyntax = `?${commandName} BinhLH`;
+        return message.channel.send(`${barrierEmoji} Lệnh \`${commandName}\` cần có tham số (tên người chơi hoặc vật phẩm). VD: \`${exampleSyntax}\` hoặc \`/${commandName}\``);
+      }
+
+      const userId = message.author.id;
+      const spamCheck = commandHandler.checkSpam(userId);
+      if (spamCheck.isSpam) {
+        return message.channel.send(spamCheck.message);
+      }
+
+      // Thông báo lưu ý chuyển đổi khi người dùng vẫn đang gõ '?'
+      const tipText = `> 💡 **Lưu ý:** *Nếu lệnh tiền tố \`?${commandName}\` không phản hồi, bạn hãy sử dụng Slash Command (\`/${commandName}\`) nhé!*`;
+
+      const attachTip = (payload) => {
+        if (!showPrefixTip) return payload;
+        if (typeof payload === 'string') {
+          return `${payload}\n${tipText}`;
+        }
+        const newPayload = { ...payload };
+        if (newPayload.content) {
+          newPayload.content = `${newPayload.content}\n${tipText}`;
+        } else {
+          newPayload.content = tipText;
+        }
+        return newPayload;
+      };
+
+      // Fake Interaction Object để dùng chung logic với Slash Commands
+      const interaction = {
+        user: message.author,
+        client: client,
+        options: {
+          getString: () => argStr
+        },
+        deferReply: async () => {
+          interaction._replyMessage = await message.channel.send('⏳ Đang xử lý yêu cầu...');
+        },
+        editReply: async (data) => {
+          const finalData = attachTip(data);
+          if (interaction._replyMessage) {
+            const editPayload = typeof finalData === 'string'
+              ? { content: finalData }
+              : { content: '', ...finalData };
+            try {
+              await interaction._replyMessage.edit(editPayload);
+            } catch (editErr) {
+              console.warn('[Index] Không thể sửa replyMessage, gửi tin nhắn mới:', editErr.message);
+              await message.channel.send(finalData);
+            }
+          } else {
+            await message.channel.send(finalData);
+          }
+        },
+        reply: async (data) => {
+          await message.channel.send(attachTip(data));
+        },
+        followUp: async (data) => {
+          await message.channel.send(data);
+        }
+      };
+
+      try {
+        await command.execute(interaction, queueDispatcher);
+      } catch (error) {
+        console.error(`[Discord] Lỗi lệnh text ${commandName}:`, error);
+      } finally {
+        commandHandler.finishUserTask(userId);
+      }
+      return;
+    }
+
+    // 4. Kiểm tra xem có phải lệnh Quản trị (Admin) hay không
+    // BẮT BUỘC phải có tiền tố '!': !status, !restart, !mode, !toggle, !ai on/off, !tracker, v.v. (kể cả trong DM lẫn server)
+    // Nếu không có '!', Admin sẽ được đối xử như một người dùng bình thường (được hỏi AI, dùng lệnh game, tính toán,...)
+    let isAdminCommand = false;
+    let command = '';
+    let args = [];
+
+    if (cleanText.startsWith('!')) {
+      args = cleanText.slice(1).trim().split(/ +/);
+      command = args.shift()?.toLowerCase();
+      if (adminCommands.includes(command)) {
+        isAdminCommand = true;
+      }
+    }
+
+    // --- XỬ LÝ LỆNH ADMIN ---
+    if (isAdminCommand) {
+      console.log(`[Admin-Debug] Nhận lệnh Admin: "${command}" từ User ID: ${message.author.id} (Tên: ${message.author.tag}). ADMIN_ID cấu hình: "${ADMIN_ID}"`);
+
+      // Kiểm tra ADMIN_ID nếu đã được cấu hình
+      if (ADMIN_ID && message.author.id !== ADMIN_ID) {
+        console.warn(`[Admin-Debug] Bỏ qua tin nhắn vì User ID (${message.author.id}) không khớp với ADMIN_ID (${ADMIN_ID}).`);
+        return;
+      }
+
+    try {
+      if (command === 'help') {
+         await safeSend(message.channel, '**Danh sách lệnh Admin:**\n- `!master [status/switch]`: Xem hoặc chuyển đổi quyền giữa 2 Master (Active / Standby)\n- `!status` hoặc `!workers`: Xem danh sách và trạng thái toàn bộ Workers (Local & Remote)\n- `!restart`: Random tên mới và khởi động lại bot ngay lập tức\n- `!mode` hoặc `!render`: Chuyển đổi chế độ hiển thị danh sách (Text / Image)\n- `!toggle off/on [lời nhắn]`: Bật/tắt việc nhận Slash Commands từ user khác.\n- `!ai off/on [lời nhắn]`: Bật/tắt tính năng trò chuyện AI với người dùng.\n- `!tracker [trang]`: Xem danh sách và trạng thái theo dõi số dư định kỳ (phân trang)\n- `!tracker add <tên>`: Bật theo dõi số dư cho một người chơi\n- `!tracker untrack <tên>`: Hủy theo dõi một người chơi\n- `!tracker check`: Kích hoạt vòng lặp check bal cho các người chơi ngay lập tức');
+      } else if (command === 'tracker' || command === 'theodoi') {
+         const sub = args.shift()?.toLowerCase();
+         if (sub === 'help') {
+           return await safeSend(message.channel, '📖 **Cú pháp lệnh !tracker:**\n- `!tracker [trang]`: Xem danh sách người chơi theo dõi (mặc định trang 1, VD: `!tracker 2`)\n- `!tracker add <tên>`: Bật theo dõi số dư cho một người chơi\n- `!tracker untrack <tên>`: Hủy theo dõi một người chơi\n- `!tracker check`: Kích hoạt chu kỳ kiểm tra số dư ngay lập tức');
+         } else if (sub === 'untrack' || sub === 'remove' || sub === 'xoa') {
+           const target = args.join(' ').trim();
+           if (!target) {
+             const barrierEmoji = getCustomEmoji('barrier');
+             return await safeSend(message.channel, `${barrierEmoji} Cú pháp: \`!tracker untrack <tên_người_chơi>\``);
+           }
+           await trackerHelper.setTracking(target, false);
+           await safeSend(message.channel, `✅ Đã hủy theo dõi số dư của người chơi: **${target}**`);
+         } else if (sub === 'add' || sub === 'track' || sub === 'them') {
+           const target = args.join(' ').trim();
+           if (!target) {
+             const barrierEmoji = getCustomEmoji('barrier');
+             return await safeSend(message.channel, `${barrierEmoji} Cú pháp: \`!tracker add <tên_người_chơi>\``);
+           }
+           await trackerHelper.setTracking(target, true);
+           await safeSend(message.channel, `✅ Đã thêm người chơi **${target}** vào danh sách theo dõi số dư định kỳ!`);
+         } else if (sub === 'check' || sub === 'run') {
+           const statusMsg = await safeSend(message.channel, '🔄 **Bắt đầu chu kỳ kiểm tra số dư định kỳ cho các người chơi ngay lập tức...**');
+           if (global.trackerSchedulerInstance) {
+             global.trackerSchedulerInstance.runCheckCycle({
+               message: statusMsg,
+               channel: message.channel
+             });
+           }
+         } else {
+           const page = parseInt(sub) || 1;
+           const overview = await trackerHelper.getTrackerOverview();
+           const payload = buildTrackerOverviewMessage(overview, page);
+           await message.channel.send(payload);
+         }
+      } else if (command === 'ai') {
+         const sub = args.shift()?.toLowerCase();
+         if (sub === 'off') {
+            global.isAiChatEnabled = false;
+            global.aiDisableReason = args.join(' ') || 'Tính năng trò chuyện AI hiện đang tạm tắt.';
+            await message.channel.send(`🔴 Đã **TẮT** tính năng trò chuyện AI. Lời nhắn: \`${global.aiDisableReason}\``);
+         } else if (sub === 'on') {
+            global.isAiChatEnabled = true;
+            global.aiDisableReason = '';
+            await message.channel.send('🟢 Đã **BẬT** lại tính năng trò chuyện AI.');
+         } else {
+            const statusStr = global.isAiChatEnabled ? '🟢 Đang **BẬT**' : `🔴 Đang **TẮT** (Lý do: \`${global.aiDisableReason}\`)`;
+            await message.channel.send(`🤖 **Trạng thái AI Chat:** ${statusStr}\n\n⚙️ **Cú pháp Admin:** \`!ai on\` hoặc \`!ai off [lời nhắn]\`\n💡 *Ghi chú: Để hỏi đáp AI, vui lòng dùng \`?ai <câu hỏi>\` hoặc Slash Command \`/ai\` (trong tin nhắn riêng DM chỉ cần gõ: \`ai <câu hỏi>\`).*`);
+         }
+      } else if (command === 'mode' || command === 'render') {
+         const targetMode = args.shift()?.toLowerCase();
+         let newMode;
+         if (targetMode === 'text' || targetMode === 'image') {
+           newMode = configHelper.setDisplayMode(targetMode);
+         } else {
+           newMode = configHelper.toggleDisplayMode();
+         }
+         const modeDesc = newMode === 'image'
+           ? '🖼️ **IMAGE** (Tạo bảng HTML 3D Icon 32x32px đính kèm Embed PNG)'
+           : '📝 **TEXT** (Dòng chữ Embed truyền thống + Tên Item)';
+         await message.channel.send(`✅ Đã chuyển đổi chế độ hiển thị danh sách sang: **${newMode.toUpperCase()}**\n${modeDesc}`);
+      } else if (command === 'status' || command === 'workers') {
+         const workers = await queueDispatcher.getAllWorkersStatus();
+         if (workers.length === 0) {
+           const barrierEmoji = getCustomEmoji('barrier');
+           await message.channel.send(`${barrierEmoji} Hiện chưa có Worker nào được cấu hình.`);
+           return;
+         }
+
+         let text = `📊 **DANH SÁCH WORKERS DANG HOẠT ĐỘNG (${workers.length}):**\n\n`;
+         workers.forEach((w, idx) => {
+           let statusStr = '';
+           if (!w.online) {
+             statusStr = '❌ **Offline**';
+           } else if (!w.ready) {
+             statusStr = '⏳ **Đang chuẩn bị / Đăng nhập**';
+           } else if (w.busy) {
+             statusStr = `🟡 **Đang bận** (Check: \`${w.targetPlayer || '?'}\`)`;
+           } else {
+             statusStr = '🟢 **Rảnh / Sẵn sàng**';
+           }
+
+           text += `**${idx + 1}. [${w.type.toUpperCase()}] ${w.name}**\n`;
+           text += `   - Bot Username: \`${w.username}\`\n`;
+           text += `   - Trạng thái: ${statusStr}\n`;
+           if (w.error) text += `   - Lỗi: \`${w.error}\`\n`;
+           text += '\n';
+         });
+
+          await safeSend(message.channel, text);
+      } else if (command === 'restart') {
+         const statusMsg = await message.channel.send('🔄 **Đang gửi yêu cầu khởi động lại (restart) tới tất cả các Workers...**');
+         const results = await queueDispatcher.restartAllWorkers();
+
+         if (results.length === 0) {
+           const barrierEmoji = getCustomEmoji('barrier');
+           await statusMsg.edit(`${barrierEmoji} Hiện không tìm thấy Worker nào (Local hoặc Remote) được cấu hình để restart.`);
+           return;
+         }
+
+         let replyText = `✅ **ĐÃ GỬI LỆNH RESTART TỚI TẤT CẢ WORKERS (${results.length}):**\n\n`;
+         results.forEach((res, idx) => {
+           if (res.success) {
+             replyText += `**${idx + 1}. [${res.type.toUpperCase()}] ${res.name}**\n   - Trạng thái: 🟢 Đã nhận lệnh restart (Tên mới: \`${res.username}\`)\n`;
+           } else {
+             replyText += `**${idx + 1}. [${res.type.toUpperCase()}] ${res.name}**\n   - Trạng thái: ❌ Thất bại (\`${res.error}\`)\n`;
+           }
+         });
+         await statusMsg.edit(replyText);
+      } else if (command === 'toggle') {
+         const sub = args.shift()?.toLowerCase();
+         if (sub === 'off') {
+            global.isBotMaintenance = true;
+            global.maintenanceMessage = args.join(' ') || 'Hệ thống đang bảo trì, vui lòng quay lại sau.';
+            await message.channel.send(`✅ Đã TẮT nhận lệnh. Lời nhắn: ${global.maintenanceMessage}`);
+         } else if (sub === 'on') {
+            global.isBotMaintenance = false;
+            global.maintenanceMessage = '';
+            await message.channel.send('✅ Đã BẬT nhận lệnh trở lại.');
+         } else {
+            await message.channel.send('Cú pháp: `!toggle on` hoặc `!toggle off [lời nhắn]`');
+         }
+      } else if (command === 'master' || command === 'failover') {
+         const sub = args.shift()?.toLowerCase();
+         if (sub === 'switch' || sub === 'handoff' || sub === 'stepdown') {
+            const statusMsg = await message.channel.send('🔄 **Đang gửi yêu cầu từ chức Leader... Master dự phòng sẽ tự động tiếp quản!**');
+            const res = await masterElection.stepDown('Admin yêu cầu chuyển quyền qua lệnh !master switch');
+            if (res.success) {
+              await statusMsg.edit('✅ **Đã bàn giao quyền Leader thành công!** Node này đã trở về trạng thái STANDBY.');
+            } else {
+              await statusMsg.edit(`❌ Chuyển đổi thất bại: ${res.error}`);
+            }
+         } else {
+            const st = await masterElection.getStatus();
+            const leaderInfo = st.currentLeader;
+            let desc = `👑 **HỆ THỐNG LUÂN PHIÊN 2 MASTER (HIGH AVAILABILITY):**\n\n`;
+            desc += `• **Node hiện tại:** \`${st.thisNode.instanceName}\` (\`${st.thisNode.instanceId}\`)\n`;
+            desc += `• **Vai trò:** ${st.thisNode.isLeader ? '🟢 **ACTIVE LEADER** (Đang trực tiếp phục vụ)' : '🛡️ **STANDBY BACKUP** (Đang chờ dự phòng)'}\n`;
+            desc += `• **URL:** \`${st.thisNode.selfUrl || 'Chưa cấu hình URL'}\`\n\n`;
+            if (leaderInfo) {
+              desc += `• **Leader đang giữ quyền:** \`${leaderInfo.leaderName}\` (ID: \`${leaderInfo.leaderId}\`)\n`;
+              desc += `• **URL Leader:** \`${leaderInfo.leaderUrl || 'N/A'}\`\n`;
+              desc += `• **Nhịp tim cuối:** \`${leaderInfo.lastHeartbeatAgoSec}s trước\` (${leaderInfo.isAlive ? '🟢 Sống' : '🔴 Mất tín hiệu'})\n`;
+              desc += `• **Nhiệm kỳ (Term):** \`#${leaderInfo.term}\`\n`;
+            } else {
+              desc += `• **Leader đang giữ quyền:** *Chưa xác định*\n`;
+            }
+            desc += `• **Thời gian chờ Failover:** \`${st.failoverTimeoutSec}s\`\n\n`;
+            desc += `💡 *Để chuyển quyền ngay cho Master dự phòng, gõ:* \`!master switch\``;
+            await safeSend(message.channel, desc);
+         }
+      }
+    } catch (cmdErr) {
+      console.error('[Admin-Debug] Lỗi gửi tin nhắn trả lời:', cmdErr);
+    }
+    return;
+  }
+
+  // --- LUỒNG 2: TRỢ LÝ AI (ĐỘC LẬP & TÁCH RỜI VỚI LUỒNG LỆNH) ---
+  // Kích hoạt khi:
+  // 1. Dùng lệnh tiền tố rõ ràng: ?ai <câu hỏi> (trong guild hoặc DM)
+  // 2. Nhắn trong tin nhắn riêng (DM): ai <câu hỏi>
+  const isAiExplicitCommand = /^\?ai(\s+|$)/i.test(cleanText) ||
+    (isDirectMessage && /^ai(\s+|$)/i.test(cleanText));
+  if (isAiExplicitCommand) {
+    if (global.isAiChatEnabled === false) {
+      await message.reply(`⚠️ **Thông báo:** ${global.aiDisableReason || 'Tính năng AI Chat hiện đang tạm tắt.'}`);
+      return;
+    }
+    const promptText = cleanText.replace(/^\??ai\s*/i, '').trim();
+    if (!promptText) {
+      await message.reply('👋 Bạn đã gọi kênh AI! Vui lòng nhập câu hỏi kèm theo. VD: `?ai Cách chế tạo khiên trong Minecraft?` hoặc dùng Slash Command `/ai`.');
+      return;
+    }
+    await handleAiChatMessage(message, promptText);
+    return;
+  }
+
+  // --- LUỒNG 3: TÍNH TOÁN TOÁN HỌC THUẦN TÚY (PURE MATH ENGINE) ---
+  // 1. Cú pháp tiền tố: ?math <biểu thức>, ?calc <biểu thức>, ?tinh <biểu thức> (hoặc trong DM: math ...)
+  const isMathExplicitCommand = /^\?(math|calc|tinh)(\s+|$)/i.test(cleanText) ||
+    (isDirectMessage && /^(math|calc|tinh)(\s+|$)/i.test(cleanText));
+  if (isMathExplicitCommand) {
+    const mathExpression = cleanText.replace(/^\??(math|calc|tinh)\s*/i, '').trim();
+    await handleMathMessage(message, mathExpression);
+    return;
+  }
+
+  // 2. Tự động nhận dạng phép tính toán học (không cần chữ math):
+  // Hỗ trợ:
+  // - Khi có tiền tố ? (kênh chat hoặc DM): ?12*2, ? 12*2, ?(15+5)*2
+  // - Trong tin nhắn riêng (DM): 12*2, (15 + 25) * 4
+  let mathCandidate = null;
+  if (cleanText.startsWith('?')) {
+    mathCandidate = cleanText.slice(1).trim();
+  } else if (isDirectMessage) {
+    mathCandidate = cleanText.trim();
+  }
+
+  if (mathCandidate && isMathExpression(mathCandidate)) {
+    await handleMathMessage(message, mathCandidate);
+    return;
+  }
+  });
+
+  if (BOT_ROLE === 'master') {
+    // Khởi động cơ chế bầu chọn Master tự động (High Availability Active - Standby)
+    console.log('[Index] 🚀 Bắt đầu khởi động cơ chế bầu chọn Master (Leader Election)...');
+    masterElection.start({
+      discordClient: client,
+      queueDispatcher,
+      startSchedulerFn: startTrackerScheduler,
+      getSelfUrlFn: () => process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || process.env.MASTER_URL || process.env.SELF_URL || ''
+    }).catch(err => {
+      console.error('[Index] Lỗi khởi động MasterElection:', err.message);
+    });
+  } else {
+    // Chế độ Standalone: Luôn tự đăng nhập Discord bot trực tiếp
+    if (DISCORD_TOKEN && DISCORD_TOKEN !== 'your_discord_bot_token_here') {
+      client.login(DISCORD_TOKEN);
+    } else {
+      console.error('[Discord-Bot] Chưa cấu hình DISCORD_TOKEN trong file .env!');
+    }
+  }
+}
+
+// Bắt ngoại lệ để tránh crash process
+process.on('uncaughtException', err => {
+  console.error('[Process] Lỗi uncaughtException:', err);
+});
+
+process.on('unhandledRejection', reason => {
+  console.error('[Process] Lỗi unhandledRejection:', reason);
+});

@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.local
+*.log
+.cache/
+debug/
+netlify-pages/
+data/*
+!data/minecraft_lang_vi.json
+.vscode/
+config/render_accounts.json
+config/*.local.json
