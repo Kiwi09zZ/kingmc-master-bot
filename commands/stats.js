@@ -1,0 +1,143 @@
+/**
+ * commands/stats.js - Slash Command /stats
+ */
+
+const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { getCustomEmoji, getStatsLabel, isDecorationItem, cleanMinecraftText, smallCapsToStandardUpper } = require('../helpers/utils');
+const { recordError } = require('../helpers/reportHelper');
+const trackerHelper = require('../helpers/trackerHelper');
+const skinHelper = require('../helpers/skinHelper');
+
+module.exports = {
+  data: new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription('Kiểm tra stats (chỉ số) của một người chơi trên KingMC')
+    .addStringOption(option => 
+      option.setName('player')
+        .setDescription('Tên người chơi Minecraft cần kiểm tra')
+        .setRequired(true)
+    ),
+
+  async execute(interaction, queueDispatcher) {
+    const targetPlayer = interaction.options.getString('player').trim();
+    const BOT_CHECK_TIMEOUT = parseInt(process.env.BOT_CHECK_TIMEOUT) || 15000;
+
+    await interaction.deferReply();
+
+    try {
+      // Gửi tác vụ vào Queue Dispatcher
+      const result = await queueDispatcher.enqueueTask('stats', targetPlayer, BOT_CHECK_TIMEOUT);
+
+      // Lưu cache skin vào Master Node nếu kết quả có chứa skin
+      if (result && result.skin) {
+        const skinData = result.skin;
+        const skinUrlOrId = skinData.skinUrl || skinData.url || skinData.textureId;
+        if (skinUrlOrId) {
+          await skinHelper.saveSkin(targetPlayer, skinUrlOrId, skinData.model);
+        }
+      }
+
+      // Trang trí giao diện hiển thị Embed
+      const netherStarEmoji = getCustomEmoji('nether_star');
+      const barrierEmoji = getCustomEmoji('barrier');
+      const bellEmoji = getCustomEmoji('bell');
+      const mapEmoji = getCustomEmoji('map');
+
+      const embed = new EmbedBuilder()
+        .setTitle(`${netherStarEmoji} Stats: **${targetPlayer}** ${netherStarEmoji}`)
+        .setColor('#2b2d31')
+        .setThumbnail(skinHelper.getAvatarUrl(targetPlayer, 64, true))
+        .setFooter({ text: 'CheckStatsKingMC • Thiết kế bởi BinhLH' })
+        .setTimestamp();
+
+      const validItems = (result.items || []).filter(item => !isDecorationItem(item));
+
+      if (validItems.length === 0) {
+        embed.setDescription(`${barrierEmoji} **Lưu ý:** Không tìm thấy stats nào hữu ích hoặc người chơi này chưa từng đăng nhập.`);
+        embed.setColor('#ef4444');
+      } else {
+        const formattedItems = [];
+        
+        validItems.forEach(item => {
+          const rawCleanDisplay = cleanMinecraftText(item.displayName);
+          // Chuyển đổi phông chữ Small Caps độc lạ sang chữ in hoa tiêu chuẩn (Kiểu 1: MONEY, SHARDS, KILLS...)
+          const convertedTitle = smallCapsToStandardUpper(rawCleanDisplay);
+          const label = getStatsLabel(item);
+          const displayTitle = (convertedTitle || label).trim();
+
+          // Lấy đúng Emoji 3D từ item.name của Minecraft GUI (emerald, amethyst_shard, netherite_sword...)
+          const emoji = getCustomEmoji(item.name || rawCleanDisplay);
+          
+          const cleanLoreLines = (item.lore || [])
+            .map(line => cleanMinecraftText(line))
+            .filter(line => {
+              if (!line) return false;
+              if (/^[_\-+=*~]*$/.test(line)) return false;
+              if (line.includes('------') || line.includes('======') || line.includes('______')) return false;
+              const lower = line.toLowerCase();
+              if (lower.includes('nhấp') || lower.includes('click') || lower.includes('click chuột')) return false;
+              return true;
+            });
+
+          const valueText = cleanLoreLines.join(', ');
+          if (valueText) {
+            formattedItems.push(`${emoji} **${displayTitle.toUpperCase()}** | \`${valueText}\``);
+          }
+        });
+
+        let descriptionText = formattedItems.join('\n');
+
+        if (descriptionText.length > 4096) {
+          descriptionText = descriptionText.substring(0, 4080) + '...';
+        }
+        
+        embed.setDescription(descriptionText);
+      }
+
+      // Kiểm tra trạng thái theo dõi số dư của người chơi và thêm nút tương tác
+      const isTracking = await trackerHelper.isTracking(targetPlayer);
+      const row = new ActionRowBuilder();
+      if (!isTracking) {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`track_bal_${targetPlayer}`)
+            .setLabel('Theo dõi số dư')
+            .setEmoji(bellEmoji)
+            .setStyle(ButtonStyle.Primary)
+        );
+      } else {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`track_bal_${targetPlayer}`)
+            .setLabel('Xem biến động')
+            .setEmoji(mapEmoji)
+            .setStyle(ButtonStyle.Success)
+        );
+      }
+
+      await interaction.editReply({ embeds: [embed], components: [row] });
+
+    } catch (error) {
+      console.error(`[Discord-Bot] Lỗi khi xử lý lệnh stats cho ${targetPlayer}:`, error.message);
+      recordError('stats', targetPlayer, error);
+
+      const barrierEmoji = getCustomEmoji('barrier');
+      const errorEmbed = new EmbedBuilder()
+        .setTitle(`${barrierEmoji} Lỗi kiểm tra stats`)
+        .setDescription(`Không thể lấy stats của người chơi **${targetPlayer}**.\n\n${barrierEmoji} Đã có lỗi xảy ra trong quá trình xử lý yêu cầu. Vui lòng thử lại sau hoặc bấm nút **Báo lỗi** bên dưới để gửi thông báo tới Admin!`)
+        .setColor('#ef4444')
+        .setFooter({ text: 'CheckStatsKingMC • Thiết kế bởi BinhLH' })
+        .setTimestamp();
+        
+      const row = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId(`report_error_stats_${targetPlayer}`)
+            .setLabel('Báo lỗi')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+      await interaction.editReply({ embeds: [errorEmbed], components: [row] });
+    }
+  }
+};
