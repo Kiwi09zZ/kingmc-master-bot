@@ -1,0 +1,137 @@
+const { checkSensitiveContent } = require('../helpers/filterHelper');
+const { performWebSearch, shouldPerformWebSearch } = require('../helpers/searchHelper');
+const { countWords } = require('../helpers/utils');
+const groqManager = require('../helpers/groqHelper');
+
+// Bộ nhớ đệm lưu lịch sử chat ngắn hạn theo channelId hoặc userId
+// Map<string, Array<{role: string, content: string}>>
+const conversationHistory = new Map();
+const MAX_HISTORY = 6; // Lưu tối đa 6 câu thoại gần nhất (3 cặp hỏi - đáp)
+
+/**
+ * Xử lý sự kiện tin nhắn AI trong Discord (Luồng độc lập)
+ * @param {import('discord.js').Message} message 
+ * @param {string|null} customPromptText
+ */
+async function handleAiChatMessage(message, customPromptText = null) {
+  try {
+    // 1. Bỏ qua tin nhắn từ Bot khác hoặc từ chính bot
+    if (message.author.bot) return;
+
+    // 2. Kiểm tra xem tính năng AI Chat có đang bị Admin TẮT hay không
+    if (global.isAiChatEnabled === false) {
+      console.log(`[AIChat] Bỏ qua câu hỏi vì tính năng AI Chat hiện đang bị TẮT.`);
+      return;
+    }
+
+    // 3. Tách lấy câu hỏi sạch (sử dụng customPromptText hoặc loại bỏ tiền tố ai)
+    let promptText = customPromptText;
+    if (!promptText) {
+      promptText = message.content.replace(/^\??ai\s*/i, '').trim();
+    }
+
+    if (!promptText) {
+      await message.reply('👋 Bạn đã gọi kênh AI! Vui lòng nhập câu hỏi kèm theo. VD: `?ai Cách chế tạo khiên trong Minecraft?` hoặc dùng Slash Command `/ai`.');
+      return;
+    }
+
+    // 4. Kiểm tra từ ngữ nhạy cảm / không phù hợp (Im lặng bỏ qua, không nhắn vào kênh)
+    const filterResult = checkSensitiveContent(promptText);
+    if (filterResult.isBlocked) {
+      console.log(`[AIChat] 🛑 Chặn câu hỏi nhạy cảm từ ${message.author.tag}: "${promptText}" (Từ vi phạm: ${filterResult.matchedWord})`);
+      return;
+    }
+
+    // 5. Hiển thị trạng thái "đang gõ..." (typing indicator)
+    await message.channel.sendTyping();
+
+    // 6. Tự động tìm kiếm thông tin trên Internet nếu câu hỏi yêu cầu dữ liệu thời gian thực
+    let finalPromptContent = promptText;
+    if (shouldPerformWebSearch(promptText)) {
+      const searchResults = await performWebSearch(promptText, 4);
+      if (searchResults.length > 0) {
+        const searchContext = searchResults
+          .map((item, idx) => `[${idx + 1}] ${item.title}\nNội dung: ${item.snippet}\nNguồn: ${item.url}`)
+          .join('\n\n');
+        
+        finalPromptContent = `[Dữ liệu tìm kiếm thời gian thực từ Internet]:\n${searchContext}\n\n[Câu hỏi của người dùng]: "${promptText}"\n\nHãy dựa vào dữ liệu tìm kiếm thời gian thực trên (nếu có ích) để tổng hợp và trả lời thật ngắn gọn, súc tích (bắt buộc dưới 100 từ) bằng tiếng Việt.`;
+      }
+    }
+
+    // 7. Quản lý lịch sử cuộc hội thoại
+    const historyKey = message.channel.isDMBased() ? message.author.id : message.channel.id;
+    if (!conversationHistory.has(historyKey)) {
+      conversationHistory.set(historyKey, []);
+    }
+    const history = conversationHistory.get(historyKey);
+
+    // Chuẩn bị tin nhắn gửi sang Groq AI
+    const messages = [
+      ...history,
+      { role: 'user', content: finalPromptContent }
+    ];
+
+    // 8. Gửi câu hỏi sang Groq AI (với cơ chế xoay vòng API Keys)
+    const aiReply = await groqManager.chat(messages);
+
+    // 8.1. Kiểm tra giới hạn độ dài phản hồi (tối đa 100 chữ)
+    const wordCount = countWords(aiReply);
+    if (wordCount > 100) {
+      console.warn(`[AIChat] ⚠️ Phản hồi AI quá dài (${wordCount} chữ > 100 chữ). Lập tức drop câu trả lời.`);
+      await message.reply('⚠️ **Thông báo:** Câu trả lời từ AI vượt quá giới hạn cho phép (tối đa 100 chữ), bot không thể trả lời. Vui lòng đặt câu hỏi cụ thể hơn hoặc yêu cầu tóm tắt ngắn gọn!');
+      return;
+    }
+
+    // 8.2. Cập nhật lịch sử thoại (chỉ lưu nếu câu trả lời hợp lệ)
+    history.push({ role: 'user', content: promptText });
+    history.push({ role: 'assistant', content: aiReply });
+    
+    // Giới hạn số lượng tin nhắn trong lịch sử
+    if (history.length > MAX_HISTORY) {
+      history.splice(0, history.length - MAX_HISTORY);
+    }
+
+    // 9. Trả lời trên Discord (Xử lý cắt nhỏ tin nhắn nếu dài hơn 2000 ký tự)
+    if (aiReply.length <= 2000) {
+      await message.reply(aiReply);
+    } else {
+      const chunks = splitMessage(aiReply, 1900);
+      for (let i = 0; i < chunks.length; i++) {
+        if (i === 0) {
+          await message.reply(chunks[i]);
+        } else {
+          await message.channel.send(chunks[i]);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[AIChat] Lỗi xử lý trò chuyện AI:', error.message);
+    try {
+      await message.reply(`⚠️ Rất tiếc, đã xảy ra lỗi khi kết nối với AI: ${error.message}`);
+    } catch (e) {}
+  }
+}
+
+/**
+ * Cắt nhỏ tin nhắn dài thành mảng các chuỗi ngắn vừa vặn với giới hạn Discord (2000 chars)
+ */
+function splitMessage(text, maxLength = 1900) {
+  const chunks = [];
+  let currentChunk = '';
+
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if ((currentChunk + '\n' + line).length > maxLength) {
+      if (currentChunk) chunks.push(currentChunk);
+      currentChunk = line;
+    } else {
+      currentChunk = currentChunk ? currentChunk + '\n' + line : line;
+    }
+  }
+  if (currentChunk) chunks.push(currentChunk);
+  return chunks;
+}
+
+module.exports = {
+  handleAiChatMessage
+};
