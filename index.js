@@ -641,7 +641,7 @@ function startTrackerScheduler(queueDispatcher) {
         if (record.success && record.result) {
           successCount++;
           const rawBal = record.result;
-          const balStr = (rawBal && typeof rawBal === 'object' && rawBal.balance) ? rawBal.balance : String(rawBal || '');
+          const balStr = (rawBal && typeof rawBal === 'object' && rawBal.balance) ? String(rawBal.balance) : String(rawBal || '');
           let cleanVal = balStr;
           if (cleanVal && cleanVal.includes('$')) {
             const dollarIndex = cleanVal.indexOf('$');
@@ -809,7 +809,6 @@ if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
     await commandHandler.handleInteraction(interaction);
   });
 
-  // Lắng nghe lệnh qua DM hoặc Kênh chat (Admin)
   // Lắng nghe lệnh qua DM hoặc Kênh chat (Admin & User)
   client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
@@ -959,8 +958,9 @@ if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
       console.log(`[Admin-Debug] Nhận lệnh Admin: "${command}" từ User ID: ${message.author.id} (Tên: ${message.author.tag}). ADMIN_ID cấu hình: "${ADMIN_ID}"`);
 
       // Kiểm tra ADMIN_ID nếu đã được cấu hình
-      if (ADMIN_ID && message.author.id !== ADMIN_ID) {
-        console.warn(`[Admin-Debug] Bỏ qua tin nhắn vì User ID (${message.author.id}) không khớp với ADMIN_ID (${ADMIN_ID}).`);
+      // Nếu chưa cấu hình ADMIN_ID thì KHÔNG cho ai chạy lệnh Admin (tránh ai cũng !restart / !toggle được)
+      if (!ADMIN_ID || message.author.id !== ADMIN_ID) {
+        console.warn(`[Admin-Debug] Bỏ qua tin nhắn vì User ID (${message.author.id}) không khớp với ADMIN_ID (${ADMIN_ID || 'chưa cấu hình'}).`);
         return;
       }
 
@@ -989,11 +989,14 @@ if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
            await safeSend(message.channel, `✅ Đã thêm người chơi **${target}** vào danh sách theo dõi số dư định kỳ!`);
          } else if (sub === 'check' || sub === 'run') {
            const statusMsg = await safeSend(message.channel, '🔄 **Bắt đầu chu kỳ kiểm tra số dư định kỳ cho các người chơi ngay lập tức...**');
-           if (global.trackerSchedulerInstance) {
-             global.trackerSchedulerInstance.runCheckCycle({
+           if (typeof global.runTrackerCheckCycle === 'function') {
+             global.runTrackerCheckCycle({
                message: statusMsg,
                channel: message.channel
-             });
+             }).catch(err => console.error('[TrackerScheduler] Lỗi chạy check thủ công:', err.message));
+           } else {
+             const barrierEmoji = getCustomEmoji('barrier');
+             await safeSend(message.channel, `${barrierEmoji} Tiến trình kiểm tra chưa khởi động (bot chưa sẵn sàng hoặc node này không phải Leader).`);
            }
          } else {
            const page = parseInt(sub) || 1;
@@ -1035,7 +1038,7 @@ if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
            return;
          }
 
-         let text = `📊 **DANH SÁCH WORKERS DANG HOẠT ĐỘNG (${workers.length}):**\n\n`;
+         let text = `📊 **DANH SÁCH WORKERS ĐANG HOẠT ĐỘNG (${workers.length}):**\n\n`;
          workers.forEach((w, idx) => {
            let statusStr = '';
            if (!w.online) {
@@ -1089,6 +1092,10 @@ if (BOT_ROLE === 'master' || BOT_ROLE === 'standalone') {
             await message.channel.send('Cú pháp: `!toggle on` hoặc `!toggle off [lời nhắn]`');
          }
       } else if (command === 'master' || command === 'failover') {
+         if (BOT_ROLE !== 'master') {
+           await message.channel.send('ℹ️ Lệnh này chỉ dùng được khi chạy với `BOT_ROLE=master` (cơ chế bầu chọn Leader).');
+           return;
+         }
          const sub = args.shift()?.toLowerCase();
          if (sub === 'switch' || sub === 'handoff' || sub === 'stepdown') {
             const statusMsg = await message.channel.send('🔄 **Đang gửi yêu cầu từ chức Leader... Master dự phòng sẽ tự động tiếp quản!**');
